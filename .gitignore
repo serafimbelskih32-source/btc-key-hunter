@@ -10,6 +10,7 @@ __pycache__/
 btc_hunter.log
 ADDRESSES_WITH_BALANCE.txt
 FOUND.txt
+targets.bloom
 
 # Python env
 *.egg-info/

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-BTC Key Hunter v3.3 — Rich TUI dashboard + Bitcoin Core RPC batch scanner.
+BTC Key Hunter v3.5 — Rich TUI dashboard + Bitcoin Core RPC batch scanner.
 """
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ import threading
 import queue
 import ctypes
 import winsound
+import struct
+import math
 from pathlib import Path
 from datetime import datetime
 from collections import deque
@@ -32,7 +34,7 @@ from rich.style import Style
 from rich.align import Align
 from rich.segment import Segment
 
-VERSION      = "3.3"
+VERSION      = "3.5"
 RPC_HOST     = "127.0.0.1"
 RPC_PORT     = 8332
 RPC_USER     = "bitcoin"
@@ -46,6 +48,11 @@ FOUND_FILE   = Path.home() / "Desktop" / "FOUND.txt"
 # это O(targets) на каждый адрес и с большим списком начнёт тормозить батч.
 MAX_TARGETS_FOR_MATCH_STAT = 200
 
+# Выше какого числа строк в targets.txt переходим с обычного set() (точный,
+# но ~100 байт/адрес в памяти) на Bloom-фильтр (~5-6 байт/адрес, вероятностный).
+BLOOM_THRESHOLD = 50_000
+BLOOM_FP_RATE   = 1e-9   # при миллиардах проверок за долгий прогон не захламляет находки
+
 def _app_dir() -> Path:
     """Папка рядом с .exe (frozen) или со скриптом (запуск из исходников)."""
     if getattr(sys, "frozen", False):
@@ -53,27 +60,125 @@ def _app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 TARGETS_FILE = _app_dir() / "targets.txt"
+BLOOM_FILE   = _app_dir() / "targets.bloom"
 
 _DEFAULT_TARGETS_FILE = """\
 # Один биткоин-адрес на строку.
 # Строки с # и пустые строки игнорируются.
-# Программа параллельно ищет совпадение с любым из этих адресов
-# (помимо основной задачи — найти ЛЮБОЙ адрес с ненулевым балансом).
+# Программа ОДНОВРЕМЕННО и параллельно:
+#   1) ищет точное совпадение с любым адресом из этого списка
+#   2) ищет вообще любой адрес с ненулевым балансом (не зависит от списка)
+# Оба события просто фиксируются (файл + звук + счётчик) и НЕ
+# останавливают сканирование — со списком в десятки миллионов адресов
+# одно совпадение не повод прекращать поиск.
+# Если строк больше 50 000 — автоматически используется Bloom-фильтр
+# (кэшируется в targets.bloom рядом с этим файлом, строится один раз).
 12ib7dApVFvg82TXKycWBNpN8kFyiAN1dr
 """
 
-def load_targets() -> list[str]:
+class BloomFilter:
+    """
+    Компактный вероятностный набор: ~5-6 байт/элемент вместо ~100 у set()
+    из строк. Ложные срабатывания настраиваются через fp_rate — при
+    BLOOM_FP_RATE=1e-9 ожидаемое число случайных ложных "находок" за весь
+    прогон (даже на миллиардах проверенных адресов) кратно меньше единицы.
+    """
+    __slots__ = ("m", "k", "bits")
+    MAGIC = b"BTCHBLM1"
+
+    def __init__(self, m: int, k: int, bits: bytearray | None = None):
+        self.m = m
+        self.k = k
+        self.bits = bits if bits is not None else bytearray((m + 7) // 8)
+
+    @classmethod
+    def sized_for(cls, n: int, fp_rate: float = BLOOM_FP_RATE) -> "BloomFilter":
+        n = max(n, 1)
+        m = max(8, math.ceil(-(n * math.log(fp_rate)) / (math.log(2) ** 2)))
+        k = max(1, round((m / n) * math.log(2)))
+        return cls(m, k)
+
+    def _indices(self, item: bytes):
+        h1, h2 = struct.unpack("<QQ", hashlib.blake2b(item, digest_size=16).digest())
+        m = self.m
+        for i in range(self.k):
+            yield (h1 + i * h2) % m
+
+    def add(self, item: bytes):
+        bits = self.bits
+        for idx in self._indices(item):
+            bits[idx >> 3] |= 1 << (idx & 7)
+
+    def __contains__(self, item: bytes) -> bool:
+        bits = self.bits
+        for idx in self._indices(item):
+            if not (bits[idx >> 3] & (1 << (idx & 7))):
+                return False
+        return True
+
+    @property
+    def size_mb(self) -> float:
+        return len(self.bits) / 1024 ** 2
+
+    def save(self, path: Path, n_items: int):
+        with open(path, "wb") as f:
+            f.write(self.MAGIC)
+            f.write(struct.pack("<QQQ", self.m, self.k, n_items))
+            f.write(bytes(self.bits))
+
+    @classmethod
+    def load(cls, path: Path) -> tuple["BloomFilter", int]:
+        with open(path, "rb") as f:
+            if f.read(len(cls.MAGIC)) != cls.MAGIC:
+                raise ValueError("Повреждённый или несовместимый targets.bloom")
+            m, k, n_items = struct.unpack("<QQQ", f.read(24))
+            bits = bytearray(f.read())
+        return cls(m, k, bits), n_items
+
+def _iter_target_lines(path: Path):
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                yield line
+
+def _count_target_lines(path: Path) -> int:
+    return sum(1 for _ in _iter_target_lines(path))
+
+def init_targets(progress=print) -> tuple[str, "set[str] | BloomFilter", int]:
+    """
+    Возвращает (mode, data, count):
+      mode="exact" -> data это set[str] точных адресов
+      mode="bloom" -> data это BloomFilter (вероятностный, для больших списков)
+    Создаёт targets.txt при первом запуске. Для файлов > BLOOM_THRESHOLD
+    строк строит targets.bloom один раз и переиспользует его, пока
+    targets.txt не изменится (сверка по mtime).
+    """
     if not TARGETS_FILE.exists():
         TARGETS_FILE.write_text(_DEFAULT_TARGETS_FILE, encoding="utf-8")
-    targets = []
-    for line in TARGETS_FILE.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#"):
-            targets.append(line)
-    return targets
 
-TARGETS     = load_targets()
-TARGETS_SET = set(TARGETS)
+    n = _count_target_lines(TARGETS_FILE)
+
+    if n <= BLOOM_THRESHOLD:
+        return "exact", set(_iter_target_lines(TARGETS_FILE)), n
+
+    if BLOOM_FILE.exists() and BLOOM_FILE.stat().st_mtime >= TARGETS_FILE.stat().st_mtime:
+        progress(f"Загружаю кэш Bloom-фильтра ({BLOOM_FILE.name})...")
+        bf, cached_n = BloomFilter.load(BLOOM_FILE)
+        return "bloom", bf, cached_n
+
+    progress(f"Строю Bloom-индекс из {n:,} адресов (разово, кэшируется в {BLOOM_FILE.name})...")
+    bf = BloomFilter.sized_for(n)
+    t0 = time.time()
+    for addr in _iter_target_lines(TARGETS_FILE):
+        bf.add(addr.encode("ascii", errors="ignore"))
+    bf.save(BLOOM_FILE, n)
+    progress(f"Готово за {time.time() - t0:.1f}s, занимает {bf.size_mb:.1f} МБ в памяти.")
+    return "bloom", bf, n
+
+TARGETS_MODE  = "exact"
+TARGETS_DATA: "set[str] | BloomFilter" = set()
+TARGETS_COUNT = 0
 
 # ───────────────────────── secp256k1 ─────────────────────────
 P  = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
@@ -155,8 +260,8 @@ def derive(k: int) -> dict:
 def matches(addr: str, target: str) -> int:
     return sum(1 for i, c in enumerate(addr) if i < len(target) and c == target[i])
 
-def best_match_against_targets(addr: str, targets: list[str]) -> int:
-    """Лучшее посимвольное совпадение addr с любым адресом из targets."""
+def best_match_against_targets(addr: str, targets) -> int:
+    """Лучшее посимвольное совпадение addr с любым адресом из targets (только exact-режим)."""
     best = 0
     for t in targets:
         m = matches(addr, t)
@@ -164,13 +269,24 @@ def best_match_against_targets(addr: str, targets: list[str]) -> int:
             best = m
     return best
 
-def hit_target(d: dict, targets_set: set) -> str | None:
-    """Возвращает совпавший целевой адрес, если один из адресов кошелька в targets_set."""
-    if d["addr_unc"] in targets_set:
-        return d["addr_unc"]
-    if d["addr_cmp"] in targets_set:
-        return d["addr_cmp"]
-    return None
+def hit_target(d: dict) -> str | None:
+    """
+    Возвращает совпавший целевой адрес (exact или bloom-режим из TARGETS_MODE/TARGETS_DATA).
+    В bloom-режиме совпадение вероятностное (см. BLOOM_FP_RATE) — крайне редкий
+    ложноположительный результат возможен, поэтому found-файл это помечает.
+    """
+    if TARGETS_MODE == "exact":
+        if d["addr_unc"] in TARGETS_DATA:
+            return d["addr_unc"]
+        if d["addr_cmp"] in TARGETS_DATA:
+            return d["addr_cmp"]
+        return None
+    else:
+        if d["addr_unc"].encode("ascii") in TARGETS_DATA:
+            return d["addr_unc"]
+        if d["addr_cmp"].encode("ascii") in TARGETS_DATA:
+            return d["addr_cmp"]
+        return None
 
 # ───────────────────── Файловые операции ─────────────────────
 _log_lock = threading.Lock()
@@ -200,11 +316,17 @@ def save_balance_address(balance: str, d: dict, which_addr: str):
             )
 
 def save_found(d: dict, target: str) -> Path:
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ts   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    note = (
+        f"ВНИМАНИЕ: Bloom-режим (вероятностный, FP≈{BLOOM_FP_RATE:g}) — "
+        f"сверь адрес вручную, крошечный шанс ложного срабатывания.\n"
+        if TARGETS_MODE == "bloom" else ""
+    )
     with open(FOUND_FILE, "a", encoding="utf-8") as f:
         f.write(
             f"{'!'*70}\n"
             f"НАЙДЕН ЦЕЛЕВОЙ АДРЕС! {ts}\n"
+            f"{note}"
             f"target:            {target}\n"
             f"addr compressed:   {d['addr_cmp']}\n"
             f"addr uncompressed: {d['addr_unc']}\n"
@@ -376,18 +498,18 @@ LOGO = r"""
 # Глобальное состояние для dashboard
 class State:
     def __init__(self):
-        self.checked      = 0
-        self.speed        = 0.0
-        self.best_match   = 0
-        self.found_count  = 0
-        self.sync_pct     = 0.0
-        self.sync_blk     = 0
-        self.sync_hdr     = 0
-        self.start_time   = time.time()
-        self.last_addrs   = deque(maxlen=22)   # последние адреса для скролла
-        self.lock         = threading.Lock()
-        self.running      = True
-        self.target_found = False
+        self.checked        = 0
+        self.speed          = 0.0
+        self.best_match     = 0
+        self.found_count    = 0     # адресов с ненулевым балансом (независимо от targets.txt)
+        self.target_hits    = 0     # попаданий в targets.txt/Bloom (не останавливает сканирование)
+        self.sync_pct       = 0.0
+        self.sync_blk       = 0
+        self.sync_hdr       = 0
+        self.start_time     = time.time()
+        self.last_addrs     = deque(maxlen=22)   # последние адреса для скролла
+        self.lock           = threading.Lock()
+        self.running        = True
 
 STATE = State()
 
@@ -413,26 +535,34 @@ def make_stats() -> Panel:
         speed    = s.speed
         best     = s.best_match
         found    = s.found_count
+        thits    = s.target_hits
         spct     = s.sync_pct
         sblk     = s.sync_blk
         shdr     = s.sync_hdr
 
-    tl = max((len(t) for t in TARGETS), default=0)
+    if TARGETS_MODE == "exact":
+        tl = max((len(t) for t in TARGETS_DATA), default=0)
+    else:
+        tl = 34   # типичная длина адреса — для bloom-режима best_match не считается
 
     # Левый столбец — основная статистика
     left = Table(box=None, show_header=False, padding=(0, 1))
-    left.add_column("key",   style="bright_black", width=18)
+    left.add_column("key",   style="bright_black", width=22)
     left.add_column("value", style="bold white")
     left.add_row("⏱  Время работы",    f"[cyan]{runtime}[/cyan]")
     left.add_row("🔍 Проверено",        f"[bold white]{checked:,}[/bold white]")
     left.add_row("⚡ Скорость",         f"[bold green]{speed:,.0f}[/bold green] [dim]адр/сек[/dim]")
     left.add_row("💰 Найдено балансов", f"[bold {'yellow' if found > 0 else 'white'}]{found}[/bold {'yellow' if found > 0 else 'white'}]")
+    left.add_row("🎯 Попаданий в цели", f"[bold {'bright_yellow' if thits > 0 else 'white'}]{thits}[/bold {'bright_yellow' if thits > 0 else 'white'}]")
 
     # Правый столбец — прогресс
-    if len(TARGETS) == 1:
-        targets_label = f"[dim]{TARGETS[0][:20]}…[/dim]"
-    elif len(TARGETS) > 1:
-        targets_label = f"[cyan]{len(TARGETS)}[/cyan] [dim]адресов (targets.txt)[/dim]"
+    if TARGETS_MODE == "bloom":
+        mb = TARGETS_DATA.size_mb
+        targets_label = f"[cyan]{TARGETS_COUNT:,}[/cyan] [dim]адресов, Bloom {mb:.0f} МБ[/dim]"
+    elif TARGETS_COUNT == 1:
+        targets_label = f"[dim]{next(iter(TARGETS_DATA))[:20]}…[/dim]"
+    elif TARGETS_COUNT > 1:
+        targets_label = f"[cyan]{TARGETS_COUNT}[/cyan] [dim]адресов (targets.txt)[/dim]"
     else:
         targets_label = "[dim]targets.txt пуст[/dim]"
 
@@ -490,7 +620,7 @@ def make_layout() -> Layout:
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=10),
-        Layout(name="stats",  size=8),
+        Layout(name="stats",  size=9),
         Layout(name="feed"),
     )
     layout["header"].update(_Dynamic(make_header))
@@ -500,6 +630,8 @@ def make_layout() -> Layout:
 
 # ─────────────────────────── main ────────────────────────────
 def main():
+    global TARGETS_MODE, TARGETS_DATA, TARGETS_COUNT
+
     set_console_theme()
     console = Console()
     os.system("cls")
@@ -518,15 +650,21 @@ def main():
         STATE.sync_hdr = shdr
 
     console.print(f"[bold green]✓ Подключено![/bold green] Синхронизация: [cyan]{spct:.1f}%[/cyan] (блок {sblk:,}/{shdr:,})")
-    if TARGETS:
-        console.print(f"[cyan]✓ Загружено целей из targets.txt:[/cyan] {len(TARGETS)}")
+
+    TARGETS_MODE, TARGETS_DATA, TARGETS_COUNT = init_targets(
+        progress=lambda msg: console.print(f"[dim]{msg}[/dim]")
+    )
+    if TARGETS_MODE == "bloom":
+        console.print(f"[cyan]✓ Bloom-индекс:[/cyan] {TARGETS_COUNT:,} адресов, {TARGETS_DATA.size_mb:.1f} МБ в памяти")
+    elif TARGETS_COUNT:
+        console.print(f"[cyan]✓ Загружено целей из targets.txt:[/cyan] {TARGETS_COUNT}")
     else:
-        console.print(f"[dim]targets.txt пуст — ищем любой адрес с балансом, без конкретных целей.[/dim]")
-    log(f"Старт v{VERSION}. Синхронизация: {spct:.1f}%. Батч: {BATCH_SIZE}. Целей: {len(TARGETS)}")
+        console.print("[dim]targets.txt пуст — ищем любой адрес с балансом, без конкретных целей.[/dim]")
+    log(f"Старт v{VERSION}. Синхронизация: {spct:.1f}%. Батч: {BATCH_SIZE}. Целей: {TARGETS_COUNT} ({TARGETS_MODE})")
     time.sleep(0.5)
 
-    # Если целей много — не считаем "лучшее совпадение" (дорого), только ищем точные хиты
-    track_best_match = 0 < len(TARGETS) <= MAX_TARGETS_FOR_MATCH_STAT
+    # Если целей много (или bloom-режим) — не считаем "лучшее совпадение", только точные хиты
+    track_best_match = TARGETS_MODE == "exact" and 0 < TARGETS_COUNT <= MAX_TARGETS_FOR_MATCH_STAT
 
     stop_event = threading.Event()
     batch_q    = queue.Queue(maxsize=3)
@@ -565,7 +703,7 @@ def main():
                 for d in batch:
                     if track_best_match:
                         for addr in (d["addr_unc"], d["addr_cmp"]):
-                            m = best_match_against_targets(addr, TARGETS)
+                            m = best_match_against_targets(addr, TARGETS_DATA)
                             if m > STATE.best_match:
                                 STATE.best_match = m
 
@@ -590,14 +728,15 @@ def main():
                                 STATE.last_addrs.append((bal, label, addr, wif, False))
                             feed_added = True
 
-                    hit = hit_target(d, TARGETS_SET)
+                    hit = hit_target(d)
                     if hit is not None:
                         with STATE.lock:
-                            STATE.target_found = True
+                            STATE.target_hits += 1
                         save_found(d, hit)
                         log(f"НАЙДЕН ЦЕЛЕВОЙ! {hit} | ключ: {d['raw']}")
-                        stop_event.set()
-                        break
+                        new_found.append(("TARGET", hit))
+                        # НЕ останавливаемся — список целей может быть большим (rich-list),
+                        # находка одной не значит, что дальше сканировать нечего.
 
                 for bal, addr in new_found:
                     alert_found()
@@ -609,9 +748,6 @@ def main():
 
                 set_title(f"BTC Hunter v{VERSION} | {STATE.speed:,.0f}/s | {STATE.checked:,} адресов")
 
-                if STATE.target_found:
-                    break
-
     except KeyboardInterrupt:
         pass
     finally:
@@ -619,17 +755,20 @@ def main():
 
     elapsed = time.time() - t0
     console.print()
-    if STATE.target_found:
+    if STATE.target_hits > 0 or STATE.found_count > 0:
         console.print(Panel(
-            f"[bold bright_yellow]  НАЙДЕН ЦЕЛЕВОЙ АДРЕС!  [/bold bright_yellow]\n"
-            f"[dim]Сохранено: {FOUND_FILE}[/dim]",
+            f"[bold bright_yellow]  Найдено за сессию: {STATE.found_count} с балансом, "
+            f"{STATE.target_hits} попаданий в цели  [/bold bright_yellow]\n"
+            f"[dim]Баланс-файл: {BALANCE_FILE}[/dim]\n"
+            f"[dim]Файл целей:  {FOUND_FILE}[/dim]",
             border_style="bright_yellow", style="bold"
         ))
     console.print(f"\n[dim]Проверено: [bold]{STATE.checked:,}[/bold] адресов за [bold]{elapsed:.0f}[/bold] сек "
                   f"([bold]{STATE.speed:,.0f}[/bold]/s)[/dim]")
     console.print(f"[dim]Лог: {LOG_FILE}[/dim]")
     console.print(f"[dim]Баланс-файл: {BALANCE_FILE}[/dim]")
-    log(f"Остановлено. Проверено {STATE.checked} за {elapsed:.0f}s, {STATE.speed:.0f}/s")
+    log(f"Остановлено. Проверено {STATE.checked} за {elapsed:.0f}s, {STATE.speed:.0f}/s, "
+        f"балансов: {STATE.found_count}, целей: {STATE.target_hits}")
 
 if __name__ == "__main__":
     main()
