@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-BTC Key Hunter v3.1 — Rich TUI dashboard + Bitcoin Core RPC batch scanner.
+BTC Key Hunter v3.3 — Rich TUI dashboard + Bitcoin Core RPC batch scanner.
 """
+from __future__ import annotations
 
 import hashlib
 import secrets
@@ -31,8 +32,7 @@ from rich.style import Style
 from rich.align import Align
 from rich.segment import Segment
 
-VERSION      = "3.2"
-TARGET       = "12ib7dApVFvg82TXKycWBNpN8kFyiAN1dr"
+VERSION      = "3.3"
 RPC_HOST     = "127.0.0.1"
 RPC_PORT     = 8332
 RPC_USER     = "bitcoin"
@@ -41,6 +41,39 @@ BATCH_SIZE   = 2000
 LOG_FILE     = Path.home() / "Desktop" / "btc_hunter.log"
 BALANCE_FILE = Path.home() / "Desktop" / "ADDRESSES_WITH_BALANCE.txt"
 FOUND_FILE   = Path.home() / "Desktop" / "FOUND.txt"
+
+# Выше какого числа целей не считаем "лучшее совпадение" по символам —
+# это O(targets) на каждый адрес и с большим списком начнёт тормозить батч.
+MAX_TARGETS_FOR_MATCH_STAT = 200
+
+def _app_dir() -> Path:
+    """Папка рядом с .exe (frozen) или со скриптом (запуск из исходников)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent
+
+TARGETS_FILE = _app_dir() / "targets.txt"
+
+_DEFAULT_TARGETS_FILE = """\
+# Один биткоин-адрес на строку.
+# Строки с # и пустые строки игнорируются.
+# Программа параллельно ищет совпадение с любым из этих адресов
+# (помимо основной задачи — найти ЛЮБОЙ адрес с ненулевым балансом).
+12ib7dApVFvg82TXKycWBNpN8kFyiAN1dr
+"""
+
+def load_targets() -> list[str]:
+    if not TARGETS_FILE.exists():
+        TARGETS_FILE.write_text(_DEFAULT_TARGETS_FILE, encoding="utf-8")
+    targets = []
+    for line in TARGETS_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            targets.append(line)
+    return targets
+
+TARGETS     = load_targets()
+TARGETS_SET = set(TARGETS)
 
 # ───────────────────────── secp256k1 ─────────────────────────
 P  = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
@@ -122,8 +155,22 @@ def derive(k: int) -> dict:
 def matches(addr: str, target: str) -> int:
     return sum(1 for i, c in enumerate(addr) if i < len(target) and c == target[i])
 
-def is_hit(d: dict, target: str) -> bool:
-    return target in (d["addr_unc"], d["addr_cmp"])
+def best_match_against_targets(addr: str, targets: list[str]) -> int:
+    """Лучшее посимвольное совпадение addr с любым адресом из targets."""
+    best = 0
+    for t in targets:
+        m = matches(addr, t)
+        if m > best:
+            best = m
+    return best
+
+def hit_target(d: dict, targets_set: set) -> str | None:
+    """Возвращает совпавший целевой адрес, если один из адресов кошелька в targets_set."""
+    if d["addr_unc"] in targets_set:
+        return d["addr_unc"]
+    if d["addr_cmp"] in targets_set:
+        return d["addr_cmp"]
+    return None
 
 # ───────────────────── Файловые операции ─────────────────────
 _log_lock = threading.Lock()
@@ -370,7 +417,7 @@ def make_stats() -> Panel:
         sblk     = s.sync_blk
         shdr     = s.sync_hdr
 
-    tl = len(TARGET)
+    tl = max((len(t) for t in TARGETS), default=0)
 
     # Левый столбец — основная статистика
     left = Table(box=None, show_header=False, padding=(0, 1))
@@ -382,11 +429,18 @@ def make_stats() -> Panel:
     left.add_row("💰 Найдено балансов", f"[bold {'yellow' if found > 0 else 'white'}]{found}[/bold {'yellow' if found > 0 else 'white'}]")
 
     # Правый столбец — прогресс
+    if len(TARGETS) == 1:
+        targets_label = f"[dim]{TARGETS[0][:20]}…[/dim]"
+    elif len(TARGETS) > 1:
+        targets_label = f"[cyan]{len(TARGETS)}[/cyan] [dim]адресов (targets.txt)[/dim]"
+    else:
+        targets_label = "[dim]targets.txt пуст[/dim]"
+
     match_pct = best / tl * 100 if tl else 0
     right = Table(box=None, show_header=False, padding=(0, 1))
     right.add_column("key",   style="bright_black", width=20)
     right.add_column("value", style="bold white")
-    right.add_row("🎯 TARGET",          f"[dim]{TARGET[:20]}…[/dim]")
+    right.add_row("🎯 ЦЕЛИ",            targets_label)
     right.add_row("📍 Лучшее совп.",    f"[magenta]{best}[/magenta][dim]/{tl}[/dim]  [dim]{_bar(match_pct, 14)}[/dim]")
     right.add_row("⛓  Нода (блоков)", f"[bright_blue]{sblk:,}[/bright_blue][dim]/{shdr:,}[/dim]")
     right.add_row("🔄 Синхронизация",  f"[bright_blue]{spct:.1f}%[/bright_blue]  [dim]{_bar(spct, 14)}[/dim]")
@@ -464,8 +518,15 @@ def main():
         STATE.sync_hdr = shdr
 
     console.print(f"[bold green]✓ Подключено![/bold green] Синхронизация: [cyan]{spct:.1f}%[/cyan] (блок {sblk:,}/{shdr:,})")
-    log(f"Старт v{VERSION}. Синхронизация: {spct:.1f}%. Батч: {BATCH_SIZE}")
+    if TARGETS:
+        console.print(f"[cyan]✓ Загружено целей из targets.txt:[/cyan] {len(TARGETS)}")
+    else:
+        console.print(f"[dim]targets.txt пуст — ищем любой адрес с балансом, без конкретных целей.[/dim]")
+    log(f"Старт v{VERSION}. Синхронизация: {spct:.1f}%. Батч: {BATCH_SIZE}. Целей: {len(TARGETS)}")
     time.sleep(0.5)
+
+    # Если целей много — не считаем "лучшее совпадение" (дорого), только ищем точные хиты
+    track_best_match = 0 < len(TARGETS) <= MAX_TARGETS_FOR_MATCH_STAT
 
     stop_event = threading.Event()
     batch_q    = queue.Queue(maxsize=3)
@@ -502,10 +563,11 @@ def main():
                 feed_added = False   # добавляем только 1 строку в деку за батч
 
                 for d in batch:
-                    for addr in (d["addr_unc"], d["addr_cmp"]):
-                        m = matches(addr, TARGET)
-                        if m > STATE.best_match:
-                            STATE.best_match = m
+                    if track_best_match:
+                        for addr in (d["addr_unc"], d["addr_cmp"]):
+                            m = best_match_against_targets(addr, TARGETS)
+                            if m > STATE.best_match:
+                                STATE.best_match = m
 
                     for addr, wif, label in (
                         (d["addr_unc"], d["wif_unc"], "UNC"),
@@ -528,11 +590,12 @@ def main():
                                 STATE.last_addrs.append((bal, label, addr, wif, False))
                             feed_added = True
 
-                    if is_hit(d, TARGET):
+                    hit = hit_target(d, TARGETS_SET)
+                    if hit is not None:
                         with STATE.lock:
                             STATE.target_found = True
-                        save_found(d, TARGET)
-                        log(f"НАЙДЕН ЦЕЛЕВОЙ! {d['addr_cmp']} | ключ: {d['raw']}")
+                        save_found(d, hit)
+                        log(f"НАЙДЕН ЦЕЛЕВОЙ! {hit} | ключ: {d['raw']}")
                         stop_event.set()
                         break
 
