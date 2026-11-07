@@ -124,6 +124,31 @@ python btc_hunter_with_balance.py
 ```
 Или просто двойной клик по `run.bat` — он сам найдёт Python и поставит зависимости.
 
+## Автозапуск в фоне (без окна)
+
+`btc_hunter.exe --headless` — отдельный режим без дашборда и без единого
+вывода в консоль: только пишет в `btc_hunter.log` и сохраняет находки.
+Если Bitcoin Core ещё не поднялся (например, сразу после входа в Windows),
+ждёт и переподключается каждые 30 секунд вместо того, чтобы завершиться.
+
+Чтобы программа стартовала сама при каждом входе в Windows, полностью скрыто:
+
+1. Положи `btc_hunter.exe` и `targets.txt` в одну папку
+2. Создай там `start_hidden.vbs`:
+   ```vbscript
+   Set objShell = CreateObject("WScript.Shell")
+   Set fso = CreateObject("Scripting.FileSystemObject")
+   scriptDir = fso.GetParentFolderName(WScript.ScriptFullName)
+   objShell.CurrentDirectory = scriptDir
+   objShell.Run """" & scriptDir & "\btc_hunter.exe"" --headless", 0, False
+   ```
+3. Создай ярлык на этот `.vbs` в папке автозагрузки Windows
+   (`Win+R` → `shell:startup`)
+
+Проверить, что процесс работает: диспетчер задач → вкладка «Подробности» →
+`btc_hunter.exe`. Остановить — там же «Завершить задачу», либо
+`taskkill /IM btc_hunter.exe /F` в терминале.
+
 ## Файлы на выходе
 
 | Файл | Содержимое |
@@ -132,7 +157,8 @@ python btc_hunter_with_balance.py
 | `ADDRESSES_WITH_BALANCE.txt` | Все адреса с ненулевым балансом: адрес, WIF, приватный ключ |
 | `FOUND.txt` | Каждое попадание в `targets.txt` — дописывается, не затирается, не останавливает сканирование |
 
-Все три файла пишутся на Рабочий стол.
+Все три файла (и `targets.txt`/`targets.bloom`) пишутся рядом с `.exe` —
+где бы его ни запустить, всё остаётся в одной папке.
 
 ## Сборка EXE самостоятельно
 
