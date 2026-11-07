@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-BTC Key Hunter v3.6 — Rich TUI dashboard + Bitcoin Core RPC batch scanner.
+BTC Key Hunter v3.7 — Rich TUI dashboard + Bitcoin Core RPC batch scanner.
 Запуск с --headless: без консоли/дашборда, только файлы + звук, для автозапуска в фоне.
+Запуск с --tray: значок в системном трее + маленькое окно статистики по клику.
 """
 from __future__ import annotations
 
@@ -35,7 +36,11 @@ from rich.style import Style
 from rich.align import Align
 from rich.segment import Segment
 
-VERSION      = "3.6"
+import tkinter as tk
+import pystray
+from PIL import Image, ImageDraw
+
+VERSION      = "3.7"
 RPC_HOST     = "127.0.0.1"
 RPC_PORT     = 8332
 RPC_USER     = "bitcoin"
@@ -514,6 +519,7 @@ class State:
         self.last_addrs     = deque(maxlen=22)   # последние адреса для скролла
         self.lock           = threading.Lock()
         self.running        = True
+        self.connected      = False  # для --tray: подключились к Bitcoin Core и начали сканирование
 
 STATE = State()
 
@@ -757,6 +763,166 @@ def run_headless():
         log(f"Остановлено (headless). Проверено {STATE.checked}, "
             f"балансов {STATE.found_count}, целей {STATE.target_hits}")
 
+# ───────────────────── tray (значок в трее + окно) ─────────────────────
+def _tray_icon_image(size: int = 64) -> Image.Image:
+    """Золотой ₿ на тёмном круге — тот же стиль, что у .ico, но рисуется
+    в памяти, не завязано на внешний файл рядом с exe."""
+    s   = size
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d   = ImageDraw.Draw(img)
+    GOLD, BG = (255, 190, 20, 255), (16, 12, 4, 255)
+
+    pad  = max(1, int(s * 0.05))
+    ring = max(2, int(s * 0.09))
+    d.ellipse([pad, pad, s - pad, s - pad], fill=BG)
+    d.ellipse([pad, pad, s - pad, s - pad], outline=GOLD, width=ring)
+
+    cx, cy = s / 2, s / 2
+    bh, lw = s * 0.5, max(2, int(s * 0.1))
+    left, top, bot = cx - s * 0.11, cy - bh * 0.5, cy + bh * 0.5
+    mid = cy - bh * 0.01
+    right1, right2 = cx + s * 0.17, cx + s * 0.22
+
+    d.rectangle([int(left), int(top), int(left + lw), int(bot)], fill=GOLD)
+    d.arc([int(left), int(top), int(right1), int(mid + lw * 0.4)], start=270, end=90, fill=GOLD, width=lw)
+    d.rectangle([int(left), int(mid - lw * 0.5), int(right1 - lw * 0.6), int(mid + lw * 0.5)], fill=GOLD)
+    d.arc([int(left), int(mid - lw * 0.3), int(right2), int(bot)], start=270, end=90, fill=GOLD, width=lw)
+    d.rectangle([int(left), int(bot - lw * 0.6), int(right2 - lw * 0.6), int(bot + lw * 0.15)], fill=GOLD)
+    return img
+
+def run_tray():
+    """
+    Иконка в системном трее + маленькое окно статистики по клику.
+    Сканирование идёт в фоновом потоке (как headless), окно/трей — на главном.
+    """
+    log(f"=== Старт v{VERSION} (tray, автозапуск) ===")
+
+    stop_event = threading.Event()
+
+    def scanner_thread():
+        while not test_rpc():
+            log("Bitcoin Core недоступен — повтор через 30с...")
+            if stop_event.wait(30):
+                return
+
+        spct, sblk, shdr = get_sync_progress()
+        with STATE.lock:
+            STATE.sync_pct, STATE.sync_blk, STATE.sync_hdr = spct, sblk, shdr
+
+        track_best_match = _load_targets_common(progress=log)
+        log(f"Подключено. Синхронизация {spct:.1f}%. Целей: {TARGETS_COUNT} ({TARGETS_MODE}). Батч: {BATCH_SIZE}")
+
+        with STATE.lock:
+            STATE.connected = True
+
+        batch_q = _start_workers(stop_event)
+        t0        = time.time()
+        last_stat = t0
+
+        while not stop_event.is_set():
+            try:
+                batch = batch_q.get(timeout=1)
+            except queue.Empty:
+                continue
+            process_batch(batch, track_best_match)
+            with STATE.lock:
+                elapsed     = time.time() - t0
+                STATE.speed = STATE.checked / elapsed if elapsed > 0 else 0
+            now = time.time()
+            if now - last_stat >= 300:
+                log(f"Статистика: проверено {STATE.checked:,}, {STATE.speed:.0f}/s, "
+                    f"балансов {STATE.found_count}, целей {STATE.target_hits}")
+                last_stat = now
+
+    threading.Thread(target=scanner_thread, daemon=True).start()
+
+    # ── маленькое окно статистики (скрыто, пока не кликнут по иконке) ──
+    root = tk.Tk()
+    root.title("BTC Hunter")
+    root.configure(bg="#111111")
+    root.geometry("300x270")
+    root.resizable(False, False)
+    try:
+        root.iconbitmap(str(_app_dir() / "btc_hunter.ico"))
+    except Exception:
+        pass
+    root.withdraw()
+    root.protocol("WM_DELETE_WINDOW", root.withdraw)
+
+    def show_window(icon=None, item=None):
+        root.after(0, root.deiconify)
+        root.after(0, root.lift)
+        root.after(10, lambda: root.attributes("-topmost", True))
+        root.after(150, lambda: root.attributes("-topmost", False))
+
+    def open_folder(icon=None, item=None):
+        os.startfile(str(_app_dir()))
+
+    def on_quit(icon=None, item=None):
+        stop_event.set()
+        if icon is not None:
+            icon.stop()
+        root.after(0, root.destroy)
+
+    # Трей создаём и запускаем СРАЗУ после root — до постройки виджетов окна,
+    # иначе иконка в трее не появляется (воспроизводимо на Windows + Tcl/Tk).
+    tray_icon = pystray.Icon(
+        "btc_hunter", _tray_icon_image(), "BTC Hunter",
+        pystray.Menu(
+            pystray.MenuItem("Показать статистику", show_window, default=True),
+            pystray.MenuItem("Открыть папку", open_folder),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Выход", on_quit),
+        ),
+    )
+    threading.Thread(target=tray_icon.run, daemon=True).start()
+
+    GOLD, DIM = "#ffc814", "#888888"
+    tk.Label(root, text="₿ BTC HUNTER", bg="#111111", fg=GOLD,
+             font=("Consolas", 14, "bold")).pack(pady=(14, 8))
+
+    rows = {}
+    def add_row(label):
+        f = tk.Frame(root, bg="#111111")
+        f.pack(fill="x", padx=18, pady=3)
+        tk.Label(f, text=label, bg="#111111", fg=DIM,
+                 font=("Consolas", 9), anchor="w", width=17).pack(side="left")
+        val = tk.Label(f, text="—", bg="#111111", fg="white",
+                        font=("Consolas", 9, "bold"), anchor="e")
+        val.pack(side="right")
+        rows[label] = val
+
+    for label in ("Статус", "Время работы", "Проверено", "Скорость",
+                  "Найдено балансов", "Попаданий в цели", "Синхронизация"):
+        add_row(label)
+
+    start_t = time.time()
+
+    def refresh():
+        with STATE.lock:
+            checked, speed = STATE.checked, STATE.speed
+            found, thits   = STATE.found_count, STATE.target_hits
+            spct           = STATE.sync_pct
+            connected      = STATE.connected
+
+        elapsed = int(time.time() - start_t)
+        h, rem  = divmod(elapsed, 3600)
+        m, s    = divmod(rem, 60)
+
+        rows["Статус"].config(text=("● работает" if connected else "подключение..."),
+                               fg=(GOLD if connected else DIM))
+        rows["Время работы"].config(text=f"{h:02d}:{m:02d}:{s:02d}")
+        rows["Проверено"].config(text=f"{checked:,}")
+        rows["Скорость"].config(text=f"{speed:,.0f}/с")
+        rows["Найдено балансов"].config(text=str(found), fg=(GOLD if found else "white"))
+        rows["Попаданий в цели"].config(text=str(thits), fg=(GOLD if thits else "white"))
+        rows["Синхронизация"].config(text=f"{spct:.1f}%")
+
+        root.after(1000, refresh)
+
+    refresh()
+    root.mainloop()
+
 # ─────────────────────────── main (дашборд) ────────────────────────────
 def main():
     global TARGETS_MODE, TARGETS_DATA, TARGETS_COUNT
@@ -833,7 +999,9 @@ def main():
         f"балансов: {STATE.found_count}, целей: {STATE.target_hits}")
 
 if __name__ == "__main__":
-    if "--headless" in sys.argv:
+    if "--tray" in sys.argv:
+        run_tray()
+    elif "--headless" in sys.argv:
         run_headless()
     else:
         main()
