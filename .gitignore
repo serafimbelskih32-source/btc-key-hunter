@@ -1,0 +1,17 @@
+# PyInstaller build artifacts
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.spec
+
+# Runtime output files
+btc_hunter.log
+ADDRESSES_WITH_BALANCE.txt
+FOUND.txt
+
+# Python env
+*.egg-info/
+.env
+venv/
