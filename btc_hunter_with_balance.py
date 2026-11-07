@@ -31,7 +31,7 @@ from rich.style import Style
 from rich.align import Align
 from rich.segment import Segment
 
-VERSION      = "3.1"
+VERSION      = "3.2"
 TARGET       = "12ib7dApVFvg82TXKycWBNpN8kFyiAN1dr"
 RPC_HOST     = "127.0.0.1"
 RPC_PORT     = 8332
@@ -267,6 +267,48 @@ def set_title(title: str):
     except Exception:
         pass
 
+class _COORD(ctypes.Structure):
+    _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+class _SMALL_RECT(ctypes.Structure):
+    _fields_ = [("Left", ctypes.c_short), ("Top", ctypes.c_short),
+                ("Right", ctypes.c_short), ("Bottom", ctypes.c_short)]
+
+class _CONSOLE_SCREEN_BUFFER_INFOEX(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_ulong),
+        ("dwSize", _COORD),
+        ("dwCursorPosition", _COORD),
+        ("wAttributes", ctypes.c_ushort),
+        ("srWindow", _SMALL_RECT),
+        ("dwMaximumWindowSize", _COORD),
+        ("wPopupAttributes", ctypes.c_ushort),
+        ("bFullscreenSupported", ctypes.c_int),
+        ("ColorTable", ctypes.c_uint * 16),
+    ]
+
+def set_console_theme():
+    """
+    Перекрашивает палитру консоли под тёмно-серый фон (#1E1E1E) вместо
+    стандартного чёрного cmd.exe — как в SVG-скриншоте для GitHub.
+    Также немного осветляет 'bright_black' (#3A3A3A), которым рисуются рамки.
+    """
+    try:
+        STD_OUTPUT_HANDLE = -11
+        h = ctypes.windll.kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        info = _CONSOLE_SCREEN_BUFFER_INFOEX()
+        info.cbSize = ctypes.sizeof(_CONSOLE_SCREEN_BUFFER_INFOEX)
+        if not ctypes.windll.kernel32.GetConsoleScreenBufferInfoEx(h, ctypes.byref(info)):
+            return
+        # COLORREF = 0x00BBGGRR — для серого (R=G=B) порядок не важен
+        info.ColorTable[0]  = 0x001E1E1E   # чёрный  -> тёмно-серый фон
+        info.ColorTable[8]  = 0x003A3A3A   # bright_black -> светлее серый (рамки/dim-текст)
+        info.srWindow.Right  += 1
+        info.srWindow.Bottom += 1
+        ctypes.windll.kernel32.SetConsoleScreenBufferInfoEx(h, ctypes.byref(info))
+    except Exception:
+        pass
+
 def alert_found():
     try:
         for _ in range(5):
@@ -404,6 +446,7 @@ def make_layout() -> Layout:
 
 # ─────────────────────────── main ────────────────────────────
 def main():
+    set_console_theme()
     console = Console()
     os.system("cls")
 
