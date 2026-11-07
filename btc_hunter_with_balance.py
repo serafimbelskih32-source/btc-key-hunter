@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-BTC Key Hunter v3.5 — Rich TUI dashboard + Bitcoin Core RPC batch scanner.
+BTC Key Hunter v3.6 — Rich TUI dashboard + Bitcoin Core RPC batch scanner.
+Запуск с --headless: без консоли/дашборда, только файлы + звук, для автозапуска в фоне.
 """
 from __future__ import annotations
 
@@ -34,15 +35,24 @@ from rich.style import Style
 from rich.align import Align
 from rich.segment import Segment
 
-VERSION      = "3.5"
+VERSION      = "3.6"
 RPC_HOST     = "127.0.0.1"
 RPC_PORT     = 8332
 RPC_USER     = "bitcoin"
 RPC_PASSWORD = "btc_hunter_2024"
 BATCH_SIZE   = 2000
-LOG_FILE     = Path.home() / "Desktop" / "btc_hunter.log"
-BALANCE_FILE = Path.home() / "Desktop" / "ADDRESSES_WITH_BALANCE.txt"
-FOUND_FILE   = Path.home() / "Desktop" / "FOUND.txt"
+
+def _app_dir() -> Path:
+    """Папка рядом с .exe (frozen) или со скриптом (запуск из исходников)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent
+
+# Все файлы — рядом с программой (не на Рабочем столе россыпью), чтобы
+# exe + targets.txt + результаты всегда были в одной папке, куда бы её ни перенесли.
+LOG_FILE     = _app_dir() / "btc_hunter.log"
+BALANCE_FILE = _app_dir() / "ADDRESSES_WITH_BALANCE.txt"
+FOUND_FILE   = _app_dir() / "FOUND.txt"
 
 # Выше какого числа целей не считаем "лучшее совпадение" по символам —
 # это O(targets) на каждый адрес и с большим списком начнёт тормозить батч.
@@ -52,12 +62,6 @@ MAX_TARGETS_FOR_MATCH_STAT = 200
 # но ~100 байт/адрес в памяти) на Bloom-фильтр (~5-6 байт/адрес, вероятностный).
 BLOOM_THRESHOLD = 50_000
 BLOOM_FP_RATE   = 1e-9   # при миллиардах проверок за долгий прогон не захламляет находки
-
-def _app_dir() -> Path:
-    """Папка рядом с .exe (frozen) или со скриптом (запуск из исходников)."""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent
 
 TARGETS_FILE = _app_dir() / "targets.txt"
 BLOOM_FILE   = _app_dir() / "targets.bloom"
@@ -628,7 +632,132 @@ def make_layout() -> Layout:
     layout["feed"].update(_Dynamic(make_feed))
     return layout
 
-# ─────────────────────────── main ────────────────────────────
+def process_batch(batch: list, track_best_match: bool):
+    """
+    Общая логика обработки одного батча — используется и дашбордом (main),
+    и фоновым headless-режимом (run_headless): баланс-чек, target-хиты,
+    обновление STATE, сохранение находок. Возвращает число новых находок
+    (для звукового сигнала — его вызывает caller, т.к. в headless он тоже нужен).
+    """
+    balances   = get_balances_batch(batch)
+    new_found  = 0
+    feed_added = False   # в дашборде добавляем только 1 обычную строку в деку за батч
+
+    for d in batch:
+        if track_best_match:
+            for addr in (d["addr_unc"], d["addr_cmp"]):
+                m = best_match_against_targets(addr, TARGETS_DATA)
+                if m > STATE.best_match:
+                    STATE.best_match = m
+
+        for addr, wif, label in (
+            (d["addr_unc"], d["wif_unc"], "UNC"),
+            (d["addr_cmp"], d["wif_cmp"], "CMP"),
+        ):
+            bal        = balances.get(addr, "—")
+            is_nonzero = bal not in ("0.00000000", "—")
+
+            if is_nonzero:
+                with STATE.lock:
+                    STATE.last_addrs.append((bal, label, addr, wif, True))
+                    STATE.found_count += 1
+                save_balance_address(bal, d, addr)
+                log(f"БАЛАНС {bal} | {addr}")
+                new_found += 1
+            elif not feed_added:
+                with STATE.lock:
+                    STATE.last_addrs.append((bal, label, addr, wif, False))
+                feed_added = True
+
+        hit = hit_target(d)
+        if hit is not None:
+            with STATE.lock:
+                STATE.target_hits += 1
+            save_found(d, hit)
+            log(f"НАЙДЕН ЦЕЛЕВОЙ! {hit} | ключ: {d['raw']}")
+            new_found += 1
+            # НЕ останавливаемся — список целей может быть большим (rich-list),
+            # находка одной не значит, что дальше сканировать нечего.
+
+    for _ in range(new_found):
+        alert_found()
+
+    with STATE.lock:
+        STATE.checked += len(batch)
+
+def _start_workers(stop_event: threading.Event):
+    """Поток-генератор ключей + поток обновления прогресса синхронизации ноды."""
+    def generator_worker():
+        while not stop_event.is_set():
+            batch_queue.put([derive(random_privkey()) for _ in range(BATCH_SIZE)])
+
+    def sync_worker():
+        while not stop_event.is_set():
+            time.sleep(60)
+            if stop_event.is_set(): break
+            p, b, h = get_sync_progress()
+            with STATE.lock:
+                STATE.sync_pct, STATE.sync_blk, STATE.sync_hdr = p, b, h
+
+    batch_queue = queue.Queue(maxsize=3)
+    threading.Thread(target=generator_worker, daemon=True).start()
+    threading.Thread(target=sync_worker, daemon=True).start()
+    return batch_queue
+
+def _load_targets_common(progress) -> bool:
+    """Общая загрузка targets.txt для main()/run_headless(). Возвращает track_best_match."""
+    global TARGETS_MODE, TARGETS_DATA, TARGETS_COUNT
+    TARGETS_MODE, TARGETS_DATA, TARGETS_COUNT = init_targets(progress=progress)
+    return TARGETS_MODE == "exact" and 0 < TARGETS_COUNT <= MAX_TARGETS_FOR_MATCH_STAT
+
+# ───────────────────────── headless (автозапуск) ─────────────────────────
+def run_headless():
+    """
+    Режим без консоли/дашборда — для автозапуска в фоне (Startup/Task Scheduler).
+    Ничего не печатает, только пишет в LOG_FILE и сохраняет находки. Если Bitcoin
+    Core ещё не поднялся (например, сразу после входа в Windows) — ждёт и
+    переподключается вместо того, чтобы упасть.
+    """
+    log(f"=== Старт v{VERSION} (headless, автозапуск) ===")
+
+    while not test_rpc():
+        log("Bitcoin Core недоступен — повтор через 30с...")
+        time.sleep(30)
+
+    spct, sblk, shdr = get_sync_progress()
+    with STATE.lock:
+        STATE.sync_pct, STATE.sync_blk, STATE.sync_hdr = spct, sblk, shdr
+
+    track_best_match = _load_targets_common(progress=log)
+    log(f"Подключено. Синхронизация {spct:.1f}%. Целей: {TARGETS_COUNT} ({TARGETS_MODE}). Батч: {BATCH_SIZE}")
+
+    stop_event = threading.Event()
+    batch_q    = _start_workers(stop_event)
+    t0         = time.time()
+    last_stat  = t0
+
+    try:
+        while True:
+            batch = batch_q.get()
+            process_batch(batch, track_best_match)
+
+            with STATE.lock:
+                elapsed     = time.time() - t0
+                STATE.speed = STATE.checked / elapsed if elapsed > 0 else 0
+
+            now = time.time()
+            if now - last_stat >= 300:   # раз в 5 минут, чтобы не раздувать лог
+                log(f"Статистика: проверено {STATE.checked:,}, {STATE.speed:.0f}/s, "
+                    f"балансов {STATE.found_count}, целей {STATE.target_hits}")
+                last_stat = now
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        log(f"Остановлено (headless). Проверено {STATE.checked}, "
+            f"балансов {STATE.found_count}, целей {STATE.target_hits}")
+
+# ─────────────────────────── main (дашборд) ────────────────────────────
 def main():
     global TARGETS_MODE, TARGETS_DATA, TARGETS_COUNT
 
@@ -651,7 +780,7 @@ def main():
 
     console.print(f"[bold green]✓ Подключено![/bold green] Синхронизация: [cyan]{spct:.1f}%[/cyan] (блок {sblk:,}/{shdr:,})")
 
-    TARGETS_MODE, TARGETS_DATA, TARGETS_COUNT = init_targets(
+    track_best_match = _load_targets_common(
         progress=lambda msg: console.print(f"[dim]{msg}[/dim]")
     )
     if TARGETS_MODE == "bloom":
@@ -663,88 +792,21 @@ def main():
     log(f"Старт v{VERSION}. Синхронизация: {spct:.1f}%. Батч: {BATCH_SIZE}. Целей: {TARGETS_COUNT} ({TARGETS_MODE})")
     time.sleep(0.5)
 
-    # Если целей много (или bloom-режим) — не считаем "лучшее совпадение", только точные хиты
-    track_best_match = TARGETS_MODE == "exact" and 0 < TARGETS_COUNT <= MAX_TARGETS_FOR_MATCH_STAT
-
     stop_event = threading.Event()
-    batch_q    = queue.Queue(maxsize=3)
+    batch_q    = _start_workers(stop_event)
     t0         = time.time()
-
-    def generator_worker():
-        while not stop_event.is_set():
-            batch_q.put([derive(random_privkey()) for _ in range(BATCH_SIZE)])
-
-    threading.Thread(target=generator_worker, daemon=True).start()
-
-    # Поток обновления синхронизации
-    def sync_worker():
-        while not stop_event.is_set():
-            time.sleep(60)
-            if stop_event.is_set(): break
-            p, b, h = get_sync_progress()
-            with STATE.lock:
-                STATE.sync_pct = p
-                STATE.sync_blk = b
-                STATE.sync_hdr = h
-
-    threading.Thread(target=sync_worker, daemon=True).start()
 
     layout = make_layout()
 
     try:
         with Live(layout, console=console, refresh_per_second=4, screen=True):
             while True:
-                batch    = batch_q.get()
-                balances = get_balances_batch(batch)
-
-                new_found  = []
-                feed_added = False   # добавляем только 1 строку в деку за батч
-
-                for d in batch:
-                    if track_best_match:
-                        for addr in (d["addr_unc"], d["addr_cmp"]):
-                            m = best_match_against_targets(addr, TARGETS_DATA)
-                            if m > STATE.best_match:
-                                STATE.best_match = m
-
-                    for addr, wif, label in (
-                        (d["addr_unc"], d["wif_unc"], "UNC"),
-                        (d["addr_cmp"], d["wif_cmp"], "CMP"),
-                    ):
-                        bal        = balances.get(addr, "—")
-                        is_nonzero = bal not in ("0.00000000", "—")
-
-                        if is_nonzero:
-                            # Находки всегда добавляем в деку
-                            with STATE.lock:
-                                STATE.last_addrs.append((bal, label, addr, wif, True))
-                                STATE.found_count += 1
-                            save_balance_address(bal, d, addr)
-                            log(f"БАЛАНС {bal} | {addr}")
-                            new_found.append((bal, addr))
-                        elif not feed_added:
-                            # Обычный адрес — только первый из батча
-                            with STATE.lock:
-                                STATE.last_addrs.append((bal, label, addr, wif, False))
-                            feed_added = True
-
-                    hit = hit_target(d)
-                    if hit is not None:
-                        with STATE.lock:
-                            STATE.target_hits += 1
-                        save_found(d, hit)
-                        log(f"НАЙДЕН ЦЕЛЕВОЙ! {hit} | ключ: {d['raw']}")
-                        new_found.append(("TARGET", hit))
-                        # НЕ останавливаемся — список целей может быть большим (rich-list),
-                        # находка одной не значит, что дальше сканировать нечего.
-
-                for bal, addr in new_found:
-                    alert_found()
+                batch = batch_q.get()
+                process_batch(batch, track_best_match)
 
                 with STATE.lock:
-                    STATE.checked += len(batch)
-                    elapsed        = time.time() - t0
-                    STATE.speed    = STATE.checked / elapsed if elapsed > 0 else 0
+                    elapsed     = time.time() - t0
+                    STATE.speed = STATE.checked / elapsed if elapsed > 0 else 0
 
                 set_title(f"BTC Hunter v{VERSION} | {STATE.speed:,.0f}/s | {STATE.checked:,} адресов")
 
@@ -771,4 +833,7 @@ def main():
         f"балансов: {STATE.found_count}, целей: {STATE.target_hits}")
 
 if __name__ == "__main__":
-    main()
+    if "--headless" in sys.argv:
+        run_headless()
+    else:
+        main()
