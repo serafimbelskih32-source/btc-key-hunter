@@ -1,16 +1,21 @@
 @echo off
-REM BTC Key Hunter v2.0 — Python 3.12.10 (самый стабильный)
+REM BTC Key Hunter — запуск из исходников (требуется Python 3.9+)
 setlocal
 cd /d "%~dp0"
 
-set PYTHON="C:\Users\User3\AppData\Local\Programs\Python\Python312\python.exe"
-
-if not exist %PYTHON% (
-    echo ERROR: Python 3.12.10 не найден!
+where python >nul 2>nul
+if errorlevel 1 (
+    echo ERROR: Python не найден в PATH.
+    echo Скачай Python с https://www.python.org/downloads/ и поставь галку "Add to PATH".
     pause
     exit /b 1
 )
 
-%PYTHON% launcher.py
-if errorlevel 1 %PYTHON% btc_hunter_cli.py
+python -c "import rich" >nul 2>nul
+if errorlevel 1 (
+    echo Устанавливаю зависимости...
+    python -m pip install -r requirements.txt
+)
+
+python btc_hunter_with_balance.py
 pause

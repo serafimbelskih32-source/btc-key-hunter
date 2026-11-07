@@ -362,7 +362,7 @@ def make_feed() -> Panel:
         padding=(0, 0),
     )
     table.add_column("БАЛАНС",  style="bold", width=14, justify="right")
-    table.add_column("ТИП",     style="dim",  width=4,  justify="center")
+    table.add_column("ТИП",     style="dim",  width=5,  justify="center")
     table.add_column("АДРЕС",   style="white", width=35)
     table.add_column("WIF KEY", style="dim white", no_wrap=True)
 
